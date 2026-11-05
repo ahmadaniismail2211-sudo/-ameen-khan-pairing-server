@@ -12,17 +12,20 @@
 // (a long-running Node host). Do NOT deploy it to Vercel serverless —
 // Baileys needs a persistent WebSocket connection.
 
-const express = require('express');
-const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
-
-const {
-  default: makeWASocket,
+import express from 'express';
+import cors from 'cors';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import pino from 'pino';
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-} = require('@whiskeysockets/baileys');
+} from '@whiskeysockets/baileys';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
@@ -71,7 +74,7 @@ app.post('/pairing-code', async (req, res) => {
       version,
       auth: state,
       printQRInTerminal: false,
-      logger: require('pino')({ level: 'silent' }),
+      logger: pino({ level: 'silent' }),
       browser: ['Ameen Khan', 'Chrome', '1.0'],
     });
 
