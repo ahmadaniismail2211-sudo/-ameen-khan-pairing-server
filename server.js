@@ -4,6 +4,7 @@
 //   GET  /health          -> { ok: true, name: "Ameen Khan" }
 //   GET  /servers         -> [{ id: "ameen-1", name: "Ameen Khan Server 1", status: "online" }]
 //   POST /pairing-code    -> { code: "XXXX-XXXX" }  body: { "number": "923001234567" }
+//   POST /pair             -> same as /pairing-code (the website calls /pair)
 //   GET  /status/:number  -> { connected: true/false } (best-effort, in-memory only)
 //
 // IMPORTANT: this is a minimal pairing server, not a full bot. After the user
@@ -33,6 +34,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const sessions = new Map(); // number -> { connected: boolean, code: string|null }
+const liveSockets = new Map(); // number -> Baileys socket still open for this number
 
 function cleanNumber(raw) {
   return String(raw || '').replace(/\D/g, '');
@@ -54,7 +56,7 @@ app.get('/status/:number', (req, res) => {
   res.json({ number, connected: Boolean(s && s.connected), code: s ? s.code : null });
 });
 
-app.post('/pairing-code', async (req, res) => {
+async function handlePairingCode(req, res) {
   const number = cleanNumber(req.body && req.body.number);
   if (!number || number.length < 10 || number.length > 15) {
     return res.status(400).json({ error: 'Enter a valid WhatsApp number with country code, digits only, no + or 00.' });
@@ -67,33 +69,35 @@ app.post('/pairing-code', async (req, res) => {
   fs.mkdirSync(authDir, { recursive: true });
 
   try {
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
-    const { version } = await fetchLatestBaileysVersion();
+    // Reuse the open socket for this number when there is one: opening a
+    // second socket on the same auth files makes WhatsApp close the
+    // connection and the pairing-code request fails.
+    let sock = liveSockets.get(number);
+    if (!sock) {
+      const { state, saveCreds } = await useMultiFileAuthState(authDir);
+      const { version } = await fetchLatestBaileysVersion();
 
-    const sock = makeWASocket({
-      version,
-      auth: state,
-      printQRInTerminal: false,
-      logger: pino({ level: 'silent' }),
-      browser: ['Ameen Khan', 'Chrome', '1.0'],
-    });
+      sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: false,
+        logger: pino({ level: 'silent' }),
+        browser: ['Ameen Khan', 'Chrome', '1.0'],
+      });
+      liveSockets.set(number, sock);
 
-    sock.ev.on('creds.update', saveCreds);
-    sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect } = update;
-      if (connection === 'open') {
-        sessions.set(number, { connected: true, code: sessions.get(number)?.code || null });
-      }
-      if (connection === 'close') {
-        const code = lastDisconnect?.error?.output?.statusCode;
-        if (code !== DisconnectReason.loggedOut) {
-          // Session ended; clear so a fresh code can be requested.
-          sessions.delete(number);
-        } else {
+      sock.ev.on('creds.update', saveCreds);
+      sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update;
+        if (connection === 'open') {
+          sessions.set(number, { connected: true, code: sessions.get(number)?.code || null });
+        }
+        if (connection === 'close') {
+          liveSockets.delete(number);
           sessions.delete(number);
         }
-      }
-    });
+      });
+    }
 
     // Give the socket time to initialise and connect to WhatsApp, then
     // request the code. Retry a few times: on a fresh host the first
@@ -113,19 +117,30 @@ app.post('/pairing-code', async (req, res) => {
         console.error(`pairing attempt ${attempt} failed`, e && e.message);
       }
     }
-    if (!code) throw lastErr || new Error('Could not generate a pairing code');
+    if (!code) {
+      // A dead socket must not be reused by the next request: drop it so
+      // the next tap starts with a fresh connection instead.
+      liveSockets.delete(number);
+      try { sock.end(); } catch (_) {}
+      throw lastErr || new Error('Could not generate a pairing code');
+    }
     sessions.set(number, { connected: false, code });
 
     // Keep the socket alive for 3 minutes so the user can enter the code.
     // After that, close it; the auth files remain for a reconnect.
-    setTimeout(() => { try { sock.end(); } catch (_) {} }, 3 * 60 * 1000);
+    setTimeout(() => { liveSockets.delete(number); try { sock.end(); } catch (_) {} }, 3 * 60 * 1000);
 
     return res.json({ code, number });
   } catch (err) {
     console.error('pairing error', err);
     return res.status(500).json({ error: 'Could not generate a pairing code. Check the server logs and try again in a minute.' });
   }
-});
+}
+
+// The website calls /pair; /pairing-code is the same endpoint under its
+// full name. Both answer, so the site works whichever one it uses.
+app.post('/pair', handlePairingCode);
+app.post('/pairing-code', handlePairingCode);
 
 app.listen(PORT, () => {
   console.log(`Ameen Khan pairing server running on port ${PORT}`);
